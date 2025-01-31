@@ -14,15 +14,22 @@ func RegisterInvariants(
 	k Keeper,
 	bk types.BankKeeper,
 ) {
+	ir.RegisterRoute(types.ModuleName, "reserve-backs-fractions", ReserveBacksFractionsInvariant(k))
 	ir.RegisterRoute(types.ModuleName, "balance-remainder-total", BalancedFractionalTotalInvariant(k))
 	ir.RegisterRoute(types.ModuleName, "valid-fractional-balances", ValidFractionalAmountsInvariant(k))
 	ir.RegisterRoute(types.ModuleName, "valid-remainder-amount", ValidRemainderAmountInvariant(k))
+	ir.RegisterRoute(types.ModuleName, "fractional-denom-not-in-bank", FractionalDenomNotInBankInvariant(k))
 }
 
 // AllInvariants runs all invariants of the X/precisebank module.
 func AllInvariants(k Keeper) sdk.Invariant {
 	return func(ctx sdk.Context) (string, bool) {
-		res, stop := BalancedFractionalTotalInvariant(k)(ctx)
+		res, stop := ReserveBacksFractionsInvariant(k)(ctx)
+		if stop {
+			return res, stop
+		}
+
+		res, stop = BalancedFractionalTotalInvariant(k)(ctx)
 		if stop {
 			return res, stop
 		}
@@ -37,7 +44,55 @@ func AllInvariants(k Keeper) sdk.Invariant {
 			return res, stop
 		}
 
+		res, stop = FractionalDenomNotInBankInvariant(k)(ctx)
+		if stop {
+			return res, stop
+		}
+
 		return "", false
+	}
+}
+
+// ReserveBacksFractionsInvariant checks that the total amount of backing
+// coins in the reserve is equal to the total amount of fractional balances,
+// such that the backing is always available to redeem all fractional balances
+// and there are no extra coins in the reserve that are not backing any
+// fractional balances.
+func ReserveBacksFractionsInvariant(k Keeper) sdk.Invariant {
+	return func(ctx sdk.Context) (string, bool) {
+		var (
+			msg    string
+			broken bool
+		)
+
+		fractionalBalSum := k.GetTotalSumFractionalBalances(ctx)
+		remainderAmount := k.GetRemainderAmount(ctx)
+
+		// Get the total amount of backing coins in the reserve
+		moduleAddr := k.ak.GetModuleAddress(types.ModuleName)
+		reserveIntegerBalance := k.bk.GetBalance(ctx, moduleAddr, types.IntegerCoinDenom)
+		reserveExtendedBalance := reserveIntegerBalance.Amount.Mul(types.ConversionFactor())
+
+		// The total amount of backing coins in the reserve should be equal to
+		// fractional balances + remainder amount
+		totalRequiredBacking := fractionalBalSum.Add(remainderAmount)
+
+		if !reserveExtendedBalance.Equal(totalRequiredBacking) {
+			msg = fmt.Sprintf(
+				"%s reserve balance %s mismatches %s (fractional balances %s + remainder %s)\n",
+				types.ExtendedCoinDenom,
+				reserveExtendedBalance,
+				totalRequiredBacking,
+				fractionalBalSum,
+				remainderAmount,
+			)
+			broken = true
+		}
+
+		return sdk.FormatInvariant(
+			types.ModuleName, "reserve-backing-fractional",
+			msg,
+		), broken
 	}
 }
 
@@ -117,6 +172,35 @@ func BalancedFractionalTotalInvariant(k Keeper) sdk.Invariant {
 
 		return sdk.FormatInvariant(
 			types.ModuleName, "balance-remainder-total",
+			msg,
+		), broken
+	}
+}
+
+// FractionalDenomNotInBankInvariant checks that the bank does not hold any
+// fractional denoms. These assets, e.g. akava, should only exist in the
+// x/precisebank module as this is a decimal extension of ukava that shares
+// the same total supply and is effectively the same asset. ukava held by this
+// module in x/bank backs all fractional balances in x/precisebank. If akava
+// somehow ends up in x/bank, then it would both break all expectations of this
+// module as well as be double-counted in the total supply.
+func FractionalDenomNotInBankInvariant(k Keeper) sdk.Invariant {
+	return func(ctx sdk.Context) (string, bool) {
+		extBankSupply := k.bk.GetSupply(ctx, types.ExtendedCoinDenom)
+
+		broken := !extBankSupply.IsZero()
+		msg := ""
+
+		if broken {
+			msg = fmt.Sprintf(
+				"x/bank should not hold any %v but has supply of %v",
+				types.ExtendedCoinDenom,
+				extBankSupply,
+			)
+		}
+
+		return sdk.FormatInvariant(
+			types.ModuleName, "fractional-denom-not-in-bank",
 			msg,
 		), broken
 	}
